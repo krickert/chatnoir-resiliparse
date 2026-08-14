@@ -149,6 +149,18 @@ message ParseWarcConfig {
   // PERMISSION_DENIED unless local-file access was enabled at startup,
   // since it grants clients read access to the server's filesystem.
   string archive_path = 16;
+  // parallelism, when 2 or greater, parses a streamed archive with this
+  // many concurrent workers (capped at 64). The server cuts the stream at
+  // validated gzip member boundaries and parses segments in parallel, so
+  // records arrive interleaved and out of file order: correlate events by
+  // record_index, which stays globally unique, and use
+  // metadata.stream_pos, which stays the absolute offset in the uploaded
+  // stream. A record's own events keep their order, but events of
+  // different records may interleave. Effective for gzip archives
+  // compressed record-per-member (the WARC recommendation); other inputs
+  // and single-stream gzip parse on one worker. Ignored by ParseArchive.
+  // 0 and 1 keep the sequential, file-ordered behavior.
+  uint32 parallelism = 17;
 }
 
 // ParseWarcRequest is one message of the client stream. The first message on

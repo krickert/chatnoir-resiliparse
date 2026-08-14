@@ -129,9 +129,15 @@ impl pb::warc_service_server::WarcService for WarcParser {
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<Bytes>(chunk_channel_bound(config.input_buffer_size));
         let (resp_tx, resp_rx) = mpsc::channel(RESPONSE_CHANNEL_BOUND);
-        let forwarder_tx = resp_tx.clone();
-        let panic_tx = resp_tx.clone();
+        spawn_request_forwarder(stream, chunk_tx, resp_tx.clone());
 
+        let parallelism = config.parallelism.min(MAX_PARALLELISM) as usize;
+        if parallelism >= 2 && config.archive_path.is_empty() {
+            spawn_parallel_pipeline(chunk_rx, resp_tx, config, parallelism);
+            return Ok(Response::new(ReceiverStream::new(resp_rx)));
+        }
+
+        let panic_tx = resp_tx.clone();
         // Map JoinError (panic/cancel) to a gRPC status; bare spawn_blocking
         // would drop the sender and look like a clean EOF.
         tokio::spawn(async move {
@@ -150,43 +156,6 @@ impl pb::warc_service_server::WarcService for WarcParser {
                         .await;
                 }
             }
-        });
-
-        // Forward archive bytes into the parser thread.
-        tokio::spawn(async move {
-            loop {
-                match stream.message().await {
-                    Ok(Some(msg)) => match msg.kind {
-                        Some(pb::parse_warc_request::Kind::Chunk(chunk)) => {
-                            if chunk_tx.send(chunk).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(pb::parse_warc_request::Kind::Config(_)) => {
-                            let _ = forwarder_tx
-                                .send(Err(Status::invalid_argument(
-                                    "`config` may only be set on the first request message",
-                                )))
-                                .await;
-                            break;
-                        }
-                        None => {
-                            let _ = forwarder_tx
-                                .send(Err(Status::invalid_argument(
-                                    "ParseWarc request message must set `config` or `chunk`",
-                                )))
-                                .await;
-                            break;
-                        }
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = forwarder_tx.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
-            // Dropping chunk_tx signals EOF to ChannelReader.
         });
 
         Ok(Response::new(ReceiverStream::new(resp_rx)))
@@ -210,7 +179,8 @@ impl pb::warc_service_server::WarcService for WarcParser {
                 fold_response(resp, &mut open, &mut records, &mut errors);
                 true
             };
-            parse_into(io::Cursor::new(archive), &config, &mut emit);
+            let next_index = std::sync::atomic::AtomicU64::new(0);
+            parse_into(io::Cursor::new(archive), &config, &mut emit, &next_index);
             pb::ParseArchiveResponse { records, errors }
         })
         .await;
@@ -220,6 +190,338 @@ impl pb::warc_service_server::WarcService for WarcParser {
             Err(_) => Err(Status::cancelled("WARC parser task cancelled")),
         }
     }
+}
+
+/// Forward request chunks into the parse pipeline; protocol violations and
+/// transport errors go to `err_tx`. Dropping `chunk_tx` signals EOF.
+fn spawn_request_forwarder(
+    mut stream: Streaming<pb::ParseWarcRequest>,
+    chunk_tx: mpsc::Sender<Bytes>,
+    err_tx: ResponseSender,
+) {
+    tokio::spawn(async move {
+        loop {
+            match stream.message().await {
+                Ok(Some(msg)) => match msg.kind {
+                    Some(pb::parse_warc_request::Kind::Chunk(chunk)) => {
+                        if chunk_tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(pb::parse_warc_request::Kind::Config(_)) => {
+                        let _ = err_tx
+                            .send(Err(Status::invalid_argument(
+                                "`config` may only be set on the first request message",
+                            )))
+                            .await;
+                        break;
+                    }
+                    None => {
+                        let _ = err_tx
+                            .send(Err(Status::invalid_argument(
+                                "ParseWarc request message must set `config` or `chunk`",
+                            )))
+                            .await;
+                        break;
+                    }
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = err_tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// ===========================================================
+// Parallel parse (config.parallelism >= 2)
+// ===========================================================
+
+/// Upper bound on `config.parallelism`.
+const MAX_PARALLELISM: u32 = 64;
+/// Compressed bytes per parallel segment before the scanner starts hunting
+/// for the next gzip member boundary.
+const SEGMENT_TARGET_BYTES: usize = 256 * 1024;
+/// Slots in each segment's chunk channel; bounds in-flight memory.
+const SEGMENT_CHUNK_BOUND: usize = 32;
+/// Minimum lookahead behind a boundary candidate before validating it,
+/// unless the stream has ended.
+const VALIDATE_MIN_BYTES: usize = 512;
+/// Compressed prefix handed to the boundary validator.
+const VALIDATE_WINDOW_BYTES: usize = 4096;
+/// Cap on the scanner's hunt buffer: a stream with no valid boundaries
+/// (single-member gzip) flushes to the current segment instead of growing.
+const HUNT_WINDOW_MAX_BYTES: usize = 4 * SEGMENT_TARGET_BYTES;
+
+const GZIP_MAGIC: [u8; 3] = [0x1f, 0x8b, 0x08];
+
+/// One parallel work unit: a chunk stream plus its absolute offset in the
+/// uploaded archive. Each segment starts at a gzip member boundary.
+struct Segment {
+    rx: mpsc::Receiver<Bytes>,
+    base: u64,
+}
+
+/// True when `buf` starts a gzip member whose decompressed bytes begin with
+/// `WARC/`. Rejects magic-byte false positives inside compressed data.
+fn is_warc_gzip_member(buf: &[u8]) -> bool {
+    let head = &buf[..buf.len().min(VALIDATE_WINDOW_BYTES)];
+    let mut reader = fastwarc::stream_io::gzip::GzipReader::new(io::Cursor::new(head.to_vec()));
+    let mut magic = [0u8; 5];
+    reader.read_exact(&mut magic).is_ok() && &magic == b"WARC/"
+}
+
+/// Shift record positions by the segment's base so `stream_pos` stays the
+/// absolute offset in the uploaded stream.
+fn offset_stream_pos(resp: &mut pb::ParseWarcResponse, base: u64) {
+    match &mut resp.kind {
+        Some(pb::parse_warc_response::Kind::RecordStart(start)) => {
+            if let Some(metadata) = &mut start.metadata {
+                metadata.stream_pos += base;
+            }
+        }
+        Some(pb::parse_warc_response::Kind::RecordError(error)) => error.stream_pos += base,
+        _ => {}
+    }
+}
+
+/// Launch the scanner and `workers` parser threads for one parallel stream.
+fn spawn_parallel_pipeline(
+    chunk_rx: mpsc::Receiver<Bytes>,
+    resp_tx: ResponseSender,
+    config: pb::ParseWarcConfig,
+    workers: usize,
+) {
+    let panic_tx = resp_tx.clone();
+    tokio::spawn(async move {
+        let (seg_tx, seg_rx) = mpsc::channel::<Segment>(workers * 2);
+        let seg_rx = std::sync::Arc::new(std::sync::Mutex::new(seg_rx));
+        let config = std::sync::Arc::new(config);
+        let next_index = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let mut joins = vec![tokio::task::spawn_blocking(move || run_scanner(chunk_rx, &seg_tx))];
+        for _ in 0..workers {
+            let seg_rx = seg_rx.clone();
+            let resp_tx = resp_tx.clone();
+            let config = config.clone();
+            let next_index = next_index.clone();
+            joins.push(tokio::task::spawn_blocking(move || {
+                run_parallel_worker(&seg_rx, &resp_tx, &config, &next_index);
+            }));
+        }
+        drop(resp_tx);
+        for join in joins {
+            match join.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => {
+                    let _ = panic_tx.send(Err(Status::internal("WARC parser task panicked"))).await;
+                }
+                Err(_) => {
+                    let _ = panic_tx
+                        .send(Err(Status::cancelled("WARC parser task cancelled")))
+                        .await;
+                }
+            }
+        }
+    });
+}
+
+/// Cut the incoming chunk stream into segments at validated gzip member
+/// boundaries. Non-gzip input (and gzip without further member boundaries)
+/// flows through as one segment, which parses exactly like the sequential
+/// path.
+fn run_scanner(mut chunk_rx: mpsc::Receiver<Bytes>, seg_tx: &mpsc::Sender<Segment>) {
+    // Sniff the first three bytes to pick the mode.
+    let mut sniff = BytesMut::new();
+    let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    let mut ended = false;
+    while sniff.len() < GZIP_MAGIC.len() {
+        match chunk_rx.blocking_recv() {
+            Some(chunk) if chunk.is_empty() => {}
+            Some(chunk) => {
+                sniff.extend_from_slice(&chunk);
+                pending.push_back(chunk);
+            }
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    let gzip = sniff.len() >= GZIP_MAGIC.len() && sniff[..GZIP_MAGIC.len()] == GZIP_MAGIC;
+
+    if !gzip {
+        // Passthrough: one segment, no buffering beyond the channel bounds.
+        let Some(segment) = open_segment(seg_tx, 0) else { return };
+        loop {
+            let Some(chunk) = pending.pop_front() else {
+                if ended {
+                    return;
+                }
+                match chunk_rx.blocking_recv() {
+                    Some(chunk) => pending.push_back(chunk),
+                    None => ended = true,
+                }
+                continue;
+            };
+            if segment.blocking_send(chunk).is_err() {
+                return;
+            }
+        }
+    }
+    run_gzip_scanner(chunk_rx, seg_tx, pending, ended);
+}
+
+/// Open the next segment and hand its receiving half to the worker queue.
+fn open_segment(seg_tx: &mpsc::Sender<Segment>, base: u64) -> Option<mpsc::Sender<Bytes>> {
+    let (tx, rx) = mpsc::channel(SEGMENT_CHUNK_BOUND);
+    seg_tx.blocking_send(Segment { rx, base }).ok().map(|()| tx)
+}
+
+/// Gzip mode of [`run_scanner`]: forward zero-copy up to the segment
+/// target, then buffer into a contiguous window and cut at the next
+/// validated member boundary.
+fn run_gzip_scanner(
+    mut chunk_rx: mpsc::Receiver<Bytes>,
+    seg_tx: &mpsc::Sender<Segment>,
+    mut pending: std::collections::VecDeque<Bytes>,
+    mut ended: bool,
+) {
+    let Some(mut segment) = open_segment(seg_tx, 0) else {
+        return;
+    };
+    let mut abs: u64 = 0;
+    let mut sent_in_segment: usize = 0;
+    // Contiguous hunt buffer, used only while looking for a boundary.
+    let mut window = BytesMut::new();
+    let mut window_base: u64 = 0;
+    let mut scan_pos: usize = 0;
+
+    loop {
+        if pending.is_empty() && !ended {
+            match chunk_rx.blocking_recv() {
+                Some(chunk) if chunk.is_empty() => continue,
+                Some(chunk) => pending.push_back(chunk),
+                None => ended = true,
+            }
+        }
+
+        if window.is_empty() && sent_in_segment < SEGMENT_TARGET_BYTES {
+            // Below target: forward chunks zero-copy.
+            let Some(chunk) = pending.pop_front() else {
+                if ended {
+                    return;
+                }
+                continue;
+            };
+            sent_in_segment += chunk.len();
+            abs += chunk.len() as u64;
+            if segment.blocking_send(chunk).is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // Hunting: accumulate into the contiguous window.
+        if let Some(chunk) = pending.pop_front() {
+            if window.is_empty() {
+                window_base = abs;
+            }
+            abs += chunk.len() as u64;
+            window.extend_from_slice(&chunk);
+        } else if !ended {
+            continue;
+        }
+
+        // Scan the window for a validated member boundary.
+        let mut cut_at: Option<usize> = None;
+        while scan_pos + GZIP_MAGIC.len() <= window.len() {
+            let Some(rel) = window[scan_pos..]
+                .windows(GZIP_MAGIC.len())
+                .position(|w| w == GZIP_MAGIC)
+            else {
+                scan_pos = window.len() - (GZIP_MAGIC.len() - 1);
+                break;
+            };
+            let candidate = scan_pos + rel;
+            if window.len() - candidate < VALIDATE_MIN_BYTES && !ended {
+                scan_pos = candidate;
+                break; // Wait for more lookahead before validating.
+            }
+            if is_warc_gzip_member(&window[candidate..]) {
+                cut_at = Some(candidate);
+                break;
+            }
+            scan_pos = candidate + 1;
+        }
+
+        if let Some(cut) = cut_at {
+            let before = window.split_to(cut).freeze();
+            if !before.is_empty() && segment.blocking_send(before).is_err() {
+                return;
+            }
+            let base = window_base + cut as u64;
+            let Some(next) = open_segment(seg_tx, base) else { return };
+            segment = next;
+            let rest = std::mem::take(&mut window).freeze();
+            window_base = base;
+            sent_in_segment = rest.len();
+            scan_pos = 0;
+            if !rest.is_empty() && segment.blocking_send(rest).is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // No boundary yet: bound the hunt buffer (single-member gzip never
+        // yields one), keeping a small tail so a magic split across the
+        // flush point is still found.
+        if window.len() > HUNT_WINDOW_MAX_BYTES {
+            let keep = VALIDATE_MIN_BYTES.min(window.len());
+            let flush = window.split_to(window.len() - keep).freeze();
+            window_base += flush.len() as u64;
+            scan_pos = 0;
+            if segment.blocking_send(flush).is_err() {
+                return;
+            }
+        }
+
+        if ended && pending.is_empty() {
+            if !window.is_empty() {
+                let rest = window.freeze();
+                let _ = segment.blocking_send(rest);
+            }
+            return;
+        }
+    }
+}
+
+/// Pull segments off the shared queue and parse each with the standard
+/// pipeline. `record_index` values come from the shared allocator and
+/// `stream_pos` is shifted to the segment's absolute base.
+fn run_parallel_worker(
+    seg_rx: &std::sync::Mutex<mpsc::Receiver<Segment>>,
+    resp_tx: &ResponseSender,
+    config: &pb::ParseWarcConfig,
+    next_index: &std::sync::atomic::AtomicU64,
+) {
+    let mut emitter = BatchEmitter::new(resp_tx, convert::response_batch_size(config));
+    loop {
+        let segment = match seg_rx.lock() {
+            Ok(mut guard) => guard.blocking_recv(),
+            Err(_) => None,
+        };
+        let Some(segment) = segment else { break };
+        let base = segment.base;
+        let mut emit = |mut resp: pb::ParseWarcResponse| {
+            offset_stream_pos(&mut resp, base);
+            emitter.emit(resp)
+        };
+        parse_into(RawReaderAdapter::new(ChannelReader::new(segment.rx)), config, &mut emit, next_index);
+    }
+    emitter.flush();
 }
 
 /// Fold one parse protocol message into the unary response accumulators.
@@ -289,12 +591,14 @@ fn run_parser(chunk_rx: mpsc::Receiver<Bytes>, resp_tx: &ResponseSender, config:
         // ChannelReader is BufRead over the received chunks themselves, so
         // the parser scans and skips archive bytes in place; wrapping it in
         // a BufReader would memcpy the whole stream a second time.
-        parse_into(RawReaderAdapter::new(ChannelReader::new(chunk_rx)), config, &mut emit);
+        let next_index = std::sync::atomic::AtomicU64::new(0);
+        parse_into(RawReaderAdapter::new(ChannelReader::new(chunk_rx)), config, &mut emit, &next_index);
     } else {
         match std::fs::File::open(&config.archive_path) {
             Ok(file) => {
                 let reader = io::BufReader::with_capacity(input_buffer_size, file);
-                parse_into(reader, config, &mut emit);
+                let next_index = std::sync::atomic::AtomicU64::new(0);
+                parse_into(reader, config, &mut emit, &next_index);
             }
             Err(e) => {
                 emit(record_error(0, false, format!("failed to open archive_path {}: {e}", config.archive_path)));
@@ -386,7 +690,12 @@ fn send_response(tx: &ResponseSender, msg: pb::ParseWarcResponse) -> bool {
 /// detaches the reader on those failures and subsequent `next()` calls loop
 /// on `"No reader set"`. HTTP-header failures inside an already-framed record
 /// are recoverable; the iterator consumes the remainder on the next step.
-fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConfig, emit: EmitFn<'_>) {
+fn parse_into(
+    reader: impl IntoWarcReader,
+    config: &pb::ParseWarcConfig,
+    emit: EmitFn<'_>,
+    next_index: &std::sync::atomic::AtomicU64,
+) {
     let chunk_size = if config.payload_chunk_size == 0 {
         DEFAULT_PAYLOAD_CHUNK_SIZE
     } else {
@@ -416,7 +725,6 @@ fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConfig, emit: E
     };
     let iterator = ArchiveIterator::with_options(reader, options);
 
-    let mut record_index = 0u64;
     for item in iterator {
         let record = match item {
             Ok(record) => record,
@@ -435,12 +743,14 @@ fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConfig, emit: E
             }
         }
 
+        // Allocate an index for every framed, non-filtered record (skips do
+        // not consume one). Sequential parses see 0, 1, 2, …; parallel
+        // parses share the allocator across workers, so indexes stay
+        // globally unique but follow completion order, not file order.
+        let record_index = next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match process_record(&record, record_index, config, max_header_len, chunk_size, emit) {
             ProcessOutcome::Stop => return,
-            // Advance for both successful emits and recoverable record_errors so
-            // indexes stay aligned with framed, non-filtered records (skips do not
-            // consume an index).
-            ProcessOutcome::Emitted | ProcessOutcome::Continue => record_index += 1,
+            ProcessOutcome::Emitted | ProcessOutcome::Continue => {}
         }
     }
 }

@@ -85,6 +85,13 @@ pub fn warc_requests(data: &[u8], chunk_size: usize, config: &pb::ParseWarcConfi
 /// Stream a fixture file through an in-process server and collect all
 /// response messages. Panics on transport-level errors.
 pub async fn collect_warc(file: &str, chunk_size: usize, config: &pb::ParseWarcConfig) -> Vec<pb::ParseWarcResponse> {
+    let data = std::fs::read(data_path(file)).unwrap();
+    collect_bytes(&data, chunk_size, config).await
+}
+
+/// Stream raw archive bytes through an in-process server and collect all
+/// response messages. Panics on transport-level errors.
+pub async fn collect_bytes(data: &[u8], chunk_size: usize, config: &pb::ParseWarcConfig) -> Vec<pb::ParseWarcResponse> {
     let addr = start_warc_server().await;
     let mut client = WarcServiceClient::new(
         fastwarc_grpc::transport::connect(format!("http://{addr}"))
@@ -93,8 +100,7 @@ pub async fn collect_warc(file: &str, chunk_size: usize, config: &pb::ParseWarcC
     )
     .max_decoding_message_size(fastwarc_grpc::transport::MAX_MESSAGE_SIZE)
     .max_encoding_message_size(fastwarc_grpc::transport::MAX_MESSAGE_SIZE);
-    let data = std::fs::read(data_path(file)).unwrap();
-    let requests = warc_requests(&data, chunk_size, config);
+    let requests = warc_requests(data, chunk_size, config);
     let mut stream = client
         .parse_warc(tokio_stream::iter(requests))
         .await

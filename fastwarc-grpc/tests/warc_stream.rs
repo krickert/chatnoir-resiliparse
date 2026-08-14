@@ -762,3 +762,136 @@ async fn batched_stream_matches_unbatched() {
     assert_eq!(unbatched.len(), batched.len());
     assert_eq!(unbatched.len(), 50);
 }
+
+// ===========================================================
+// Parallel parse (config.parallelism >= 2)
+// ===========================================================
+
+/// Correlated view of one record from an unordered parallel response stream.
+#[derive(Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ParallelRecord {
+    stream_pos: u64,
+    record_type: i32,
+    payload_length: u64,
+}
+
+/// Correlate unordered parallel events by `record_index`; asserts indexes
+/// are unique, every record completes, and payload chunks sum to the
+/// reported length.
+fn correlate_parallel(responses: &[pb::ParseWarcResponse]) -> Vec<ParallelRecord> {
+    use std::collections::HashMap;
+    let mut open: HashMap<u64, (ParallelRecord, u64)> = HashMap::new();
+    let mut done: HashMap<u64, ParallelRecord> = HashMap::new();
+    common::for_each_event(responses, |event| match event.kind.as_ref() {
+        Some(pb::parse_warc_response::Kind::RecordStart(start)) => {
+            let metadata = start.metadata.as_ref().unwrap();
+            let record = ParallelRecord {
+                stream_pos: metadata.stream_pos,
+                record_type: metadata.record_type,
+                payload_length: 0,
+            };
+            assert!(
+                open.insert(metadata.record_index, (record, 0)).is_none(),
+                "duplicate record_index {}",
+                metadata.record_index
+            );
+        }
+        Some(pb::parse_warc_response::Kind::PayloadChunk(chunk)) => {
+            open.get_mut(&chunk.record_index).expect("chunk before record_start").1 += chunk.data.len() as u64;
+        }
+        Some(pb::parse_warc_response::Kind::RecordEnd(end)) => {
+            let (mut record, streamed) = open.remove(&end.record_index).expect("record_end before record_start");
+            assert_eq!(streamed, end.payload_length, "payload chunks disagree with record_end");
+            record.payload_length = end.payload_length;
+            assert!(done.insert(end.record_index, record).is_none(), "duplicate record_end");
+        }
+        Some(pb::parse_warc_response::Kind::RecordError(error)) => {
+            panic!("unexpected record_error: {}", error.message);
+        }
+        _ => {}
+    });
+    assert!(open.is_empty(), "records without record_end: {open:?}");
+    let mut records: Vec<ParallelRecord> = done.into_values().collect();
+    records.sort();
+    records
+}
+
+/// A larger gzip archive: the member-per-record fixture repeated 24 times
+/// (gzip members concatenate), so the scanner cuts many segments.
+fn big_gzip_fixture() -> Vec<u8> {
+    let gz = std::fs::read(data_path("warcfile.warc.gz")).unwrap();
+    let mut big = Vec::with_capacity(gz.len() * 24);
+    for _ in 0..24 {
+        big.extend_from_slice(&gz);
+    }
+    big
+}
+
+/// Parallel gzip parsing returns the same record set as sequential parsing:
+/// same count, same absolute `stream_pos`, same types and payload lengths,
+/// with globally unique indexes.
+#[tokio::test]
+async fn parallel_gzip_matches_sequential() {
+    let big = big_gzip_fixture();
+    let sequential = common::collect_bytes(&big, 8 << 10, &default_config()).await;
+    let config = pb::ParseWarcConfig {
+        parallelism: 4,
+        ..default_config()
+    };
+    let parallel = common::collect_bytes(&big, 8 << 10, &config).await;
+
+    let expected = correlate_parallel(&sequential);
+    let actual = correlate_parallel(&parallel);
+    assert_eq!(expected.len(), 24 * 50);
+    assert_eq!(actual, expected);
+}
+
+/// Non-gzip input with parallelism set parses on a single worker and keeps
+/// the sequential result, including file order.
+#[tokio::test]
+async fn parallel_falls_back_on_plain_warc() {
+    let config = pb::ParseWarcConfig {
+        parallelism: 4,
+        ..default_config()
+    };
+    let responses = collect_warc("warcfile.warc", 8 << 10, &config).await;
+    let outcomes = group_responses(&responses);
+    assert_eq!(outcomes.len(), 50);
+    assert!(outcomes.iter().all(|o| matches!(o, RecordOutcome::Record { .. })));
+    let positions: Vec<u64> = records_only(&outcomes).iter().map(|(m, _, _)| m.stream_pos).collect();
+    let mut sorted = positions.clone();
+    sorted.sort_unstable();
+    assert_eq!(positions, sorted, "single-segment fallback must keep file order");
+}
+
+/// A gzip stream that is NOT compressed record-per-member has no internal
+/// boundaries; the scanner must fall back to one segment and still parse
+/// every record.
+#[tokio::test]
+async fn parallel_falls_back_on_single_member_gzip() {
+    use std::io::Write;
+
+    let plain = std::fs::read(data_path("warcfile.warc")).unwrap();
+    let mut writer = fastwarc::stream_io::gzip::GzipWriter::new(Vec::new());
+    writer.write_all(&plain).unwrap();
+    let single = writer.into_inner().unwrap();
+    let config = pb::ParseWarcConfig {
+        parallelism: 4,
+        ..default_config()
+    };
+    let responses = common::collect_bytes(&single, 8 << 10, &config).await;
+    let records = correlate_parallel(&responses);
+    assert_eq!(records.len(), 50);
+}
+
+/// zstd input is not split; parallelism degrades to a sequential parse.
+#[tokio::test]
+async fn parallel_falls_back_on_zstd() {
+    let config = pb::ParseWarcConfig {
+        parallelism: 8,
+        ..default_config()
+    };
+    let responses = collect_warc("warcfile.warc.zst", 8 << 10, &config).await;
+    let records = correlate_parallel(&responses);
+    assert_eq!(records.len(), 50);
+}

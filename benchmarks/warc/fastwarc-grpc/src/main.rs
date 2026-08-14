@@ -48,6 +48,14 @@ fn local_file() -> bool {
     env_flag("FASTWARC_GRPC_LOCAL")
 }
 
+/// Server-side parallel workers per stream (config.parallelism).
+fn parallelism() -> u32 {
+    std::env::var("FASTWARC_GRPC_PARALLEL")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// Number of concurrent ParseWarc streams (one connection each).
 fn jobs() -> usize {
     std::env::var("FASTWARC_GRPC_JOBS")
@@ -74,6 +82,7 @@ fn spawn_feeder(
             include_payload: Some(full),
             include_headers: Some(full),
             response_batch_size: 64,
+            parallelism: parallelism(),
             archive_path: if local { path.clone() } else { String::new() },
             ..Default::default()
         };
@@ -202,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  FASTWARC_GRPC_URL=http://host:port: remote TCP client (no in-process server)");
         println!("  FASTWARC_GRPC_LOCAL=1: server reads WARCFILE from disk; no archive upload");
         println!("  FASTWARC_GRPC_JOBS=N: N concurrent streams; reports aggregate throughput");
+        println!("  FASTWARC_GRPC_PARALLEL=N: N server-side workers per stream (gzip member split)");
         return Ok(());
     }
     let path = args[1].clone();

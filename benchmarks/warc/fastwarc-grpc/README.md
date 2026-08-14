@@ -15,6 +15,7 @@ verification, no payload or header echo. The server parses in place.
 FASTWARC_GRPC_FULL=1 ./profile WARCFILE.warc    # stream payload and headers back
 FASTWARC_GRPC_LOCAL=1 ./profile WARCFILE.warc   # server opens WARCFILE; no upload
 FASTWARC_GRPC_JOBS=8 ./profile WARCFILE.warc    # 8 concurrent streams; progress lines and summary are aggregate
+FASTWARC_GRPC_PARALLEL=16 ./profile WARC.warc.gz # 16 server-side workers split ONE stream at gzip member boundaries
 ```
 
 `BUFFER_SIZE` is the gRPC input chunk size (default 64 KiB). Throughput is
@@ -107,3 +108,21 @@ in/out, HTTP/2 receive buffer), so concurrency saturates memory bandwidth
 before it saturates the parser. Gzip streams are decompression-bound and
 scale close to linearly up to the physical core count. With `archive_path`
 the upload leg does not exist and throughput matches in-process parsing.
+
+Server-side parallelism (`config.parallelism`, one stream split at gzip
+member boundaries, unordered results):
+
+| Workers | gzip upload MiB/s | Wall time for the file |
+|---:|---:|---:|
+| 1 (sequential) | 1424 | 3.7s |
+| 2 | 2801 | 1.9s |
+| 4 | 5370 | 1.0s |
+| 8 | 10187 | 0.5s |
+| 16 | 16032 | 0.3s |
+
+Unlike `FASTWARC_GRPC_JOBS`, this cuts the wall time of a single archive:
+at 16 workers one uploaded gzip stream parses faster than in-process
+FastWARC reads the same archive uncompressed. Records arrive unordered;
+correlate by `record_index`, positions stay absolute in `stream_pos`.
+Non-gzip input parses on one worker (with a small scanner overhead), so
+leave `parallelism` unset for uncompressed streams.
