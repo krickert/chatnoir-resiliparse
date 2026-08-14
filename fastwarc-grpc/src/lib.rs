@@ -164,7 +164,10 @@
 //! of the local `ArchiveIterator` where they make sense on a remote stream: `parse_http`,
 //! `decode_http_payload`, `verify_digests`, `quirks_mode`, `max_header_len`, `record_types`,
 //! `min_content_length`, `max_content_length`, `stream_detect`, `input_buffer_size`,
-//! `include_payload`, `include_headers`, `response_batch_size`, and `archive_path`.
+//! `include_payload`, `include_headers`, `response_batch_size`, `archive_path`, and
+//! `parallelism` (server-side parallel parsing of gzip archives at member boundaries;
+//! records then arrive unordered with globally unique `record_index` and absolute
+//! `stream_pos` - see the proto comments).
 //! Filtered-out records are skipped silently, matching local iteration.
 //!
 //! Two differences from the local APIs matter:

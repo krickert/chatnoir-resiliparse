@@ -195,6 +195,15 @@ Key decisions:
   `record_start` → stream payload chunks → `record_end`.
 - **Concurrency**: each RPC stream is independent; the service is stateless
   and holds no shared parser state.
+- **Parallel parse** (`config.parallelism >= 2`): a scanner thread cuts the
+  incoming stream at gzip member boundaries (magic bytes validated by
+  decompressing a prefix and requiring `WARC/`) into bounded segment
+  channels; a worker pool parses segments concurrently with the same
+  per-record pipeline. Records arrive interleaved and out of file order:
+  `record_index` comes from a shared allocator (globally unique,
+  completion order) and `stream_pos` is shifted to the segment base so it
+  stays the absolute archive offset. Non-gzip input and single-member gzip
+  flow through as one segment, matching the sequential path.
 - **HTTP/2 windows**: tonic/h2 default to a 64 KiB flow-control window,
   which starves a multi-gigabyte archive stream.
   `transport::{configure_server, configure_endpoint, connect}` raise the
