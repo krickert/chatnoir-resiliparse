@@ -343,6 +343,7 @@ dependencies = [
 name = "fastwarc-grpc-profile"
 version = "0.1.0"
 dependencies = [
+ "fastwarc",
  "fastwarc-grpc",
  "hyper-util",
  "tokio",
