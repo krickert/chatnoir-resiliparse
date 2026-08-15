@@ -34,6 +34,15 @@ parsing alone.
 ./target/release/rawuds WARCFILE.warc 262144   # 256 KiB writes
 ```
 
+`splitcheck` (also built alongside) reports whether an archive is
+member-per-record gzip, i.e. whether `config.parallelism` can split it,
+by scanning the first 32 MiB and validating every gzip magic candidate
+the same way the server does:
+
+```bash
+./target/release/splitcheck WARCFILE.warc.gz
+```
+
 For a remote TCP run, start the server on one host and the profile binary as a
 client on another:
 

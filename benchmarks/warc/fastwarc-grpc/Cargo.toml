@@ -14,8 +14,13 @@ path = "src/main.rs"
 name = "rawuds"
 path = "src/rawuds.rs"
 
+[[bin]]
+name = "splitcheck"
+path = "src/splitcheck.rs"
+
 [dependencies]
 fastwarc-grpc = { path = "../../../fastwarc-grpc" }
+fastwarc = { path = "../../../fastwarc-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
