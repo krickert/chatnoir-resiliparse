@@ -71,6 +71,24 @@ fn jobs() -> usize {
         .unwrap_or(1)
 }
 
+/// The stream config both feeders send: matches the plain fastwarc
+/// benchmark defaults (no HTTP parse, no digests) unless `full` echoes
+/// payloads and headers back.
+fn bench_config(path: &str, buf_size: usize, full: bool, local: bool) -> pb::ParseWarcConfig {
+    pb::ParseWarcConfig {
+        parse_http: false,
+        verify_digests: false,
+        input_buffer_size: buf_size as u32,
+        payload_chunk_size: DEFAULT_PAYLOAD_CHUNK_SIZE as u32,
+        include_payload: Some(full),
+        include_headers: Some(full),
+        response_batch_size: 64,
+        parallelism: parallelism(),
+        archive_path: if local { path.to_owned() } else { String::new() },
+        ..Default::default()
+    }
+}
+
 /// Feed `config` and, unless `local`, the archive bytes into the request channel.
 fn spawn_feeder(
     path: String,
@@ -80,18 +98,7 @@ fn spawn_feeder(
     local: bool,
 ) {
     std::thread::spawn(move || {
-        let config = pb::ParseWarcConfig {
-            parse_http: false,
-            verify_digests: false,
-            input_buffer_size: buf_size as u32,
-            payload_chunk_size: DEFAULT_PAYLOAD_CHUNK_SIZE as u32,
-            include_payload: Some(full),
-            include_headers: Some(full),
-            response_batch_size: 64,
-            parallelism: parallelism(),
-            archive_path: if local { path.clone() } else { String::new() },
-            ..Default::default()
-        };
+        let config = bench_config(&path, buf_size, full, local);
         if tx
             .blocking_send(pb::ParseWarcRequest {
                 kind: Some(pb::parse_warc_request::Kind::Config(config)),
@@ -185,18 +192,7 @@ fn spawn_feeder_raw(
     local: bool,
 ) {
     std::thread::spawn(move || {
-        let config = pb::ParseWarcConfig {
-            parse_http: false,
-            verify_digests: false,
-            input_buffer_size: buf_size as u32,
-            payload_chunk_size: DEFAULT_PAYLOAD_CHUNK_SIZE as u32,
-            include_payload: Some(full),
-            include_headers: Some(full),
-            response_batch_size: 64,
-            parallelism: parallelism(),
-            archive_path: if local { path.clone() } else { String::new() },
-            ..Default::default()
-        };
+        let config = bench_config(&path, buf_size, full, local);
         let config_frame = fastwarc_grpc::grpc_frame::encode_message(&pb::ParseWarcRequest {
             kind: Some(pb::parse_warc_request::Kind::Config(config)),
         });
