@@ -77,8 +77,17 @@ fn main() {
         println!();
     }
 
-    println!("== Output shape (same upload, but every payload byte is streamed back:");
-    println!("   the wire now carries the archive twice) ==");
+    println!("== Output ladder (what producing and shipping results costs; the input");
+    println!("   is the file on disk in EVERY row, so output is the only variable) ==");
+    let o0 = o0_parse_read(&path);
+    let o1 = o1_serialize(&path);
+    let o2 = o2_socket_raw(&path);
+    let o3 = o3_socket_proto(&path);
+    let o4 = o4_grpc_echo(&path);
+    println!();
+
+    println!("== End-to-end (upload AND payload echo: the wire carries the archive");
+    println!("   both ways through the full stack) ==");
     let f3 = l3_grpc_raw(&path, file_bytes, true);
     let f4 = l4_grpc_tonic(&path, file_bytes, true);
     println!();
@@ -110,15 +119,26 @@ fn main() {
         ladder_row("gzip: L3 hand-framed upload", g3.rate(), Some(g0.rate()));
         ladder_row("gzip: L4 tonic codec upload", g4.rate(), Some(g3.rate()));
     }
-    ladder_row("payload echo: L3 hand-framed", f3.rate(), Some(l3.rate()));
-    ladder_row("payload echo: L4 tonic codec", f4.rate(), Some(l4.rate()));
+    ladder_row("O0 parse + read payloads (no output)", o0.rate(), None);
+    ladder_row("O1 + protobuf serialization, discard", o1.rate(), Some(o0.rate()));
+    ladder_row("O2 + raw bytes over unix socket", o2.rate(), Some(o0.rate()));
+    ladder_row("O3 + protobuf over unix socket", o3.rate(), Some(o2.rate()));
+    ladder_row("O4 + full gRPC stack (payload echo)", o4.rate(), Some(o3.rate()));
+    ladder_row("end-to-end: L3 hand-framed + echo", f3.rate(), Some(l3.rate()));
+    ladder_row("end-to-end: L4 tonic codec + echo", f4.rate(), Some(l4.rate()));
     println!();
-    println!("Reading the ladder: L0->L1 is the gRPC session, L1->L2 the two kernel");
-    println!("socket copies every socket consumer pays, L2->L3 the HTTP/2 transport");
-    println!("machinery (framing, flow control, runtime hops), L3->L4 the tonic");
-    println!("codec's two userspace copies per byte. The socket and transport layers");
-    println!("dominate and are not properties of this server; compressed wire input");
-    println!("and concurrent streams are the two ways around them.");
+    println!("Reading the input ladder: L0->L1 is the gRPC session, L1->L2 the two");
+    println!("kernel socket copies every socket consumer pays, L2->L3 the HTTP/2");
+    println!("transport machinery (framing, flow control, runtime hops), L3->L4 the");
+    println!("tonic codec's two userspace copies per byte.");
+    println!();
+    println!("Reading the output ladder: O0->O1 prices protobuf serialization by");
+    println!("itself, O0->O2 prices the output socket by itself, O2->O3 puts the");
+    println!("serialized form on that socket, O3->O4 adds gRPC on top.");
+    println!();
+    println!("The socket and transport layers dominate and are not properties of");
+    println!("this server; compressed wire input and concurrent streams are the two");
+    println!("ways around them.");
 }
 
 // ===========================================================
@@ -697,4 +717,293 @@ impl http_body::Body for FrameBody {
             .poll_recv(cx)
             .map(|frame| frame.map(|data| Ok(http_body::Frame::data(data))))
     }
+}
+
+// ===========================================================
+// Output ladder: input is always the file on disk; each row changes only
+// what happens to the parse results.
+// ===========================================================
+
+/// Consumer of parse results for the output ladder.
+trait OutputSink {
+    fn record_start(&mut self, record: &fastwarc::warc::record::WarcRecord, idx: u64);
+    fn payload_window(&mut self, idx: u64, offset: u64, window: &[u8]);
+    fn record_end(&mut self, idx: u64, payload_len: u64);
+    /// Flush and return bytes produced (serialized or written), if any.
+    fn finish(&mut self) -> Option<u64>;
+}
+
+/// Parse from disk, read every payload byte, hand results to `sink`.
+fn run_output(path: &str, sink: &mut impl OutputSink) -> (u64, usize) {
+    let file = std::fs::File::open(path).unwrap();
+    let reader = std::io::BufReader::with_capacity(CHUNK, file);
+    let mut payload_total = 0u64;
+    let mut records = 0usize;
+    let mut idx = 0u64;
+    for record in ArchiveIterator::new(reader).with_parse_http(false) {
+        let Ok(record) = record else { continue };
+        let mut record = record.borrow_mut();
+        sink.record_start(&record, idx);
+        let mut offset = 0u64;
+        if let Some(reader) = record.reader_mut() {
+            loop {
+                let window = reader.fill_buf().unwrap();
+                if window.is_empty() {
+                    break;
+                }
+                let n = window.len();
+                sink.payload_window(idx, offset, window);
+                reader.consume(n);
+                offset += n as u64;
+            }
+        }
+        sink.record_end(idx, offset);
+        payload_total += offset;
+        records += 1;
+        idx += 1;
+    }
+    (payload_total, records)
+}
+
+/// O0: read payloads, produce nothing.
+struct DiscardSink;
+
+impl OutputSink for DiscardSink {
+    fn record_start(&mut self, _: &fastwarc::warc::record::WarcRecord, _: u64) {}
+    fn payload_window(&mut self, _: u64, _: u64, _: &[u8]) {}
+    fn record_end(&mut self, _: u64, _: u64) {}
+    fn finish(&mut self) -> Option<u64> {
+        None
+    }
+}
+
+/// O1/O3: build the service's protobuf messages (RecordStart with lossless
+/// headers, PayloadChunk per window, RecordEnd), batch 64 per gRPC frame,
+/// encode; either discard the encoded frames or write them to a socket.
+struct ProtoSink {
+    batch: Vec<pb::ParseWarcResponse>,
+    batch_bytes: usize,
+    scratch: prost::bytes::BytesMut,
+    out: Option<std::os::unix::net::UnixStream>,
+    produced: u64,
+}
+
+impl ProtoSink {
+    fn new(out: Option<std::os::unix::net::UnixStream>) -> Self {
+        Self {
+            batch: Vec::with_capacity(64),
+            batch_bytes: 0,
+            scratch: prost::bytes::BytesMut::new(),
+            out,
+            produced: 0,
+        }
+    }
+
+    fn push(&mut self, resp: pb::ParseWarcResponse, approx: usize) {
+        self.batch.push(resp);
+        self.batch_bytes += approx;
+        if self.batch.len() >= 64 || self.batch_bytes >= (2 << 20) {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let items = std::mem::take(&mut self.batch);
+        self.batch_bytes = 0;
+        let msg = pb::ParseWarcResponse {
+            kind: Some(pb::parse_warc_response::Kind::Batch(pb::RecordBatch { items })),
+        };
+        let frame = fastwarc_grpc::grpc_frame::encode_message_into(&mut self.scratch, &msg);
+        self.produced += frame.len() as u64;
+        if let Some(out) = &mut self.out {
+            out.write_all(&frame).unwrap();
+        }
+    }
+}
+
+impl OutputSink for ProtoSink {
+    fn record_start(&mut self, record: &fastwarc::warc::record::WarcRecord, idx: u64) {
+        let metadata = fastwarc_grpc::convert::record_metadata(record, idx, true);
+        self.push(
+            pb::ParseWarcResponse {
+                kind: Some(pb::parse_warc_response::Kind::RecordStart(pb::RecordStart {
+                    metadata: Some(metadata),
+                })),
+            },
+            512,
+        );
+    }
+
+    fn payload_window(&mut self, idx: u64, offset: u64, window: &[u8]) {
+        // Same single copy out of the reader window the service makes.
+        let data = Bytes::copy_from_slice(window);
+        let approx = data.len() + 64;
+        self.push(
+            pb::ParseWarcResponse {
+                kind: Some(pb::parse_warc_response::Kind::PayloadChunk(pb::PayloadChunk {
+                    record_index: idx,
+                    offset,
+                    data,
+                })),
+            },
+            approx,
+        );
+    }
+
+    fn record_end(&mut self, idx: u64, payload_len: u64) {
+        self.push(
+            pb::ParseWarcResponse {
+                kind: Some(pb::parse_warc_response::Kind::RecordEnd(pb::RecordEnd {
+                    record_index: idx,
+                    payload_length: payload_len,
+                    ..Default::default()
+                })),
+            },
+            64,
+        );
+    }
+
+    fn finish(&mut self) -> Option<u64> {
+        self.flush();
+        Some(self.produced)
+    }
+}
+
+/// O2: write raw payload bytes to a socket, no structure at all.
+struct RawSocketSink {
+    out: std::os::unix::net::UnixStream,
+    produced: u64,
+}
+
+impl OutputSink for RawSocketSink {
+    fn record_start(&mut self, _: &fastwarc::warc::record::WarcRecord, _: u64) {}
+    fn payload_window(&mut self, _: u64, _: u64, window: &[u8]) {
+        self.out.write_all(window).unwrap();
+        self.produced += window.len() as u64;
+    }
+    fn record_end(&mut self, _: u64, _: u64) {}
+    fn finish(&mut self) -> Option<u64> {
+        Some(self.produced)
+    }
+}
+
+/// A Unix socket pair plus a thread that reads and discards one side.
+fn discard_socket() -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<()>) {
+    let (write_half, mut read_half) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            match read_half.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    (write_half, reader)
+}
+
+fn o0_parse_read(path: &str) -> Ledger {
+    let ledger = measured(|| {
+        let mut sink = DiscardSink;
+        let (payload, records) = run_output(path, &mut sink);
+        (payload, records, None, None)
+    });
+    print_row(
+        "O0  parse + read payloads, produce nothing",
+        "the output baseline: same parse as L0 but every payload byte is read out of the record, since results have to exist before they can be shipped",
+        &ledger,
+    );
+    ledger
+}
+
+fn o1_serialize(path: &str) -> Ledger {
+    let ledger = measured(|| {
+        let mut sink = ProtoSink::new(None);
+        let (payload, records) = run_output(path, &mut sink);
+        let produced = sink.finish();
+        (payload, records, None, produced)
+    });
+    print_row(
+        "O1  + protobuf serialization, discard",
+        "builds the service's exact response messages (metadata, payload chunks, batches of 64) and encodes them, but nothing leaves the process: prices serialization alone",
+        &ledger,
+    );
+    ledger
+}
+
+fn o2_socket_raw(path: &str) -> Ledger {
+    let (write_half, reader) = discard_socket();
+    let ledger = measured(|| {
+        let mut sink = RawSocketSink {
+            out: write_half,
+            produced: 0,
+        };
+        let (payload, records) = run_output(path, &mut sink);
+        let produced = sink.finish();
+        drop(sink);
+        (payload, records, None, produced)
+    });
+    reader.join().unwrap();
+    print_row(
+        "O2  + raw payload bytes over a unix socket",
+        "no protobuf, no framing: prices the output socket alone (the same two kernel copies as the input side)",
+        &ledger,
+    );
+    ledger
+}
+
+fn o3_socket_proto(path: &str) -> Ledger {
+    let (write_half, reader) = discard_socket();
+    let ledger = measured(|| {
+        let mut sink = ProtoSink::new(Some(write_half));
+        let (payload, records) = run_output(path, &mut sink);
+        let produced = sink.finish();
+        drop(sink);
+        (payload, records, None, produced)
+    });
+    reader.join().unwrap();
+    print_row(
+        "O3  + protobuf over the unix socket",
+        "serialized results on the wire, still no gRPC: O2's socket carrying O1's messages",
+        &ledger,
+    );
+    ledger
+}
+
+/// O4: the full stack on the output side only: server reads the file from
+/// disk, client receives every payload byte through gRPC.
+fn o4_grpc_echo(path: &str) -> Ledger {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let path_abs = std::fs::canonicalize(path).unwrap().to_string_lossy().into_owned();
+    let ledger = measured(|| {
+        runtime.block_on(async {
+            let sock = start_server(false).await;
+            let mut client = WarcServiceClient::new(connect(&sock).await)
+                .max_decoding_message_size(fastwarc_grpc::transport::MAX_MESSAGE_SIZE);
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(pb::ParseWarcRequest {
+                kind: Some(pb::parse_warc_request::Kind::Config(parse_config(true, Some(&path_abs)))),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            let mut stream = client.parse_warc(ReceiverStream::new(rx)).await.unwrap().into_inner();
+            let (mut payload, mut records, mut wire_out) = (0u64, 0usize, 0u64);
+            while let Some(resp) = stream.message().await.unwrap() {
+                wire_out += 5 + resp.encoded_len() as u64;
+                count_end(&resp, &mut payload, &mut records);
+            }
+            let _ = std::fs::remove_file(&sock);
+            (payload, records, None, Some(wire_out))
+        })
+    });
+    print_row(
+        "O4  + the full gRPC stack (server reads disk, client receives everything)",
+        "O3 plus HTTP/2, flow control, and the tonic codec on both ends: the complete output path as a real client sees it",
+        &ledger,
+    );
+    ledger
 }
