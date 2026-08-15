@@ -346,6 +346,8 @@ dependencies = [
  "fastwarc",
  "fastwarc-grpc",
  "hyper-util",
+ "libc",
+ "prost",
  "tokio",
  "tokio-stream",
  "tonic",

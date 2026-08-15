@@ -23,6 +23,22 @@ flat for chunk sizes between 32 KiB and 1 MiB; multi-MiB chunks lose ~30%
 to whole-message buffering. `response_batch_size` is 64; batches flush as
 they fill.
 
+`compare` (built alongside `profile`) prices each transport layer
+separately instead of comparing the whole stack against in-process
+parsing. Every row adds exactly one layer between the archive bytes and
+the parser: the parser on the file, plus the gRPC session, plus socket
+delivery, plus the gRPC upload path. A mirrored output ladder does the
+same for results (serialization alone, the output socket alone, both,
+then the full stack). The cost of a layer is the delta between adjacent
+rows, and each row prints both sides of its ledger: bytes in, wire
+traffic in both directions, records out, wall time, and CPU time. Run it
+before attributing a slowdown to any one component:
+
+```bash
+./target/release/compare WARCFILE.warc   # a WARCFILE.warc.gz sibling adds the wire-compression rows
+FASTWARC_COMPARE_JOBS=8 ./target/release/compare WARCFILE.warc
+```
+
 `rawuds` (built alongside `profile`) is a reference floor: it pushes the
 file through a bare Unix socket with no framing, protobuf, or parsing.
 Whatever it reports is the ceiling for any socket-based transport on the
@@ -90,6 +106,27 @@ Reference points:
 | `fastwarc` bench, in-process | 13937 |
 | raw Unix socket byte pipe, no framing/serde/parse (`rawuds`) | ~8500 |
 | `fastwarc` bench, in-process, gzip | 1444 |
+
+Layer ladder (`compare`, single run each, same machine and file; each row
+adds one layer, so read the "vs prev" column, not the distance to the
+top):
+
+| Layer | MiB/s | vs prev | What the delta is |
+|---|---:|---:|---|
+| L0 parser, file on disk | 12609 | - | baseline: fastwarc + one disk-read copy |
+| L1 + gRPC service (file stays on disk) | 12137 | -4% | gRPC session, protobuf metadata replies |
+| L2 + socket delivery (no protocol) | 6894 | -43% | two kernel copies every socket consumer pays |
+| L3 + gRPC upload (client streams the bytes) | 4441 | -36% | HTTP/2 transport plus the codec copies |
+| gzip: L0 parser, file on disk | 1498 | - | decompression-bound baseline |
+| gzip: L3 gRPC upload | 1469 | -2% | the whole gRPC stack, hidden behind gzip |
+
+Two rows carry the story. L2 runs at the machine's raw socket ceiling
+(7085 MiB/s in the same run), which means the parser is fully overlapped
+and simply waits on delivery: everything below L1 is the price of moving
+bytes through a socket, not of gRPC and not of the parser. And the gzip
+rows are within 2% of in-process parsing, because the wire moves
+compressed bytes while the parser does identical work: for compressed
+archives the transport tax effectively disappears.
 
 `fastwarc-grpc` profile binary, single stream:
 

@@ -18,6 +18,10 @@ path = "src/rawuds.rs"
 name = "splitcheck"
 path = "src/splitcheck.rs"
 
+[[bin]]
+name = "compare"
+path = "src/compare.rs"
+
 [dependencies]
 fastwarc-grpc = { path = "../../../fastwarc-grpc" }
 fastwarc = { path = "../../../fastwarc-rs" }
@@ -26,3 +30,5 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+prost = "0.14"
+libc = "0.2"
