@@ -26,3 +26,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+prost = "0.14"

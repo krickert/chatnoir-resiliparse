@@ -46,7 +46,7 @@ const DEFAULT_INPUT_BUFFER_SIZE: usize = 64 << 10;
 const CHUNK_CHANNEL_BYTES: usize = 32 * 1024 * 1024;
 const CHUNK_CHANNEL_BOUND_MAX: usize = 256;
 
-fn chunk_channel_bound(input_buffer_size: u32) -> usize {
+pub(crate) fn chunk_channel_bound(input_buffer_size: u32) -> usize {
     let hint = if input_buffer_size == 0 {
         DEFAULT_INPUT_BUFFER_SIZE
     } else {
@@ -56,11 +56,11 @@ fn chunk_channel_bound(input_buffer_size: u32) -> usize {
 }
 
 /// Bound of the response channel back to the client.
-const RESPONSE_CHANNEL_BOUND: usize = 1024;
+pub(crate) const RESPONSE_CHANNEL_BOUND: usize = 1024;
 /// Flush a batch before it approaches the gRPC message-size cap.
 const MAX_BATCH_BYTES: usize = 2 << 20;
 
-type ResponseSender = mpsc::Sender<Result<pb::ParseWarcResponse, Status>>;
+pub(crate) type ResponseSender = mpsc::Sender<Result<pb::ParseWarcResponse, Status>>;
 
 /// Consumer of parse protocol messages; returns `false` when the consumer is
 /// gone and the parse should stop.
@@ -72,9 +72,9 @@ type EmitFn<'a> = &'a mut dyn FnMut(pb::ParseWarcResponse) -> bool;
 /// `PermissionDenied`: letting remote clients name server-side files is a
 /// separate security domain from parsing bytes the client supplied, so it
 /// must be an explicit operator decision (see [`WarcParser::with_local_files`]).
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct WarcParser {
-    allow_local_files: bool,
+    pub(crate) allow_local_files: bool,
 }
 
 impl WarcParser {
@@ -130,34 +130,7 @@ impl pb::warc_service_server::WarcService for WarcParser {
         let (chunk_tx, chunk_rx) = mpsc::channel::<Bytes>(chunk_channel_bound(config.input_buffer_size));
         let (resp_tx, resp_rx) = mpsc::channel(RESPONSE_CHANNEL_BOUND);
         spawn_request_forwarder(stream, chunk_tx, resp_tx.clone());
-
-        let parallelism = config.parallelism.min(MAX_PARALLELISM) as usize;
-        if parallelism >= 2 && config.archive_path.is_empty() {
-            spawn_parallel_pipeline(chunk_rx, resp_tx, config, parallelism);
-            return Ok(Response::new(ReceiverStream::new(resp_rx)));
-        }
-
-        let panic_tx = resp_tx.clone();
-        // Map JoinError (panic/cancel) to a gRPC status; bare spawn_blocking
-        // would drop the sender and look like a clean EOF.
-        tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || {
-                run_parser(chunk_rx, &resp_tx, &config);
-            })
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if e.is_panic() => {
-                    let _ = panic_tx.send(Err(Status::internal("WARC parser task panicked"))).await;
-                }
-                Err(_) => {
-                    let _ = panic_tx
-                        .send(Err(Status::cancelled("WARC parser task cancelled")))
-                        .await;
-                }
-            }
-        });
-
+        start_pipeline(config, chunk_rx, resp_tx);
         Ok(Response::new(ReceiverStream::new(resp_rx)))
     }
 
@@ -190,6 +163,38 @@ impl pb::warc_service_server::WarcService for WarcParser {
             Err(_) => Err(Status::cancelled("WARC parser task cancelled")),
         }
     }
+}
+
+/// Launch the parse pipeline for one configured stream: archive bytes come
+/// in on `chunk_rx`, protocol messages go out on `resp_tx`. Shared by the
+/// tonic-codec route and the raw-frame route.
+pub(crate) fn start_pipeline(config: pb::ParseWarcConfig, chunk_rx: mpsc::Receiver<Bytes>, resp_tx: ResponseSender) {
+    let parallelism = config.parallelism.min(MAX_PARALLELISM) as usize;
+    if parallelism >= 2 && config.archive_path.is_empty() {
+        spawn_parallel_pipeline(chunk_rx, resp_tx, config, parallelism);
+        return;
+    }
+
+    let panic_tx = resp_tx.clone();
+    // Map JoinError (panic/cancel) to a gRPC status; bare spawn_blocking
+    // would drop the sender and look like a clean EOF.
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || {
+            run_parser(chunk_rx, &resp_tx, &config);
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => {
+                let _ = panic_tx.send(Err(Status::internal("WARC parser task panicked"))).await;
+            }
+            Err(_) => {
+                let _ = panic_tx
+                    .send(Err(Status::cancelled("WARC parser task cancelled")))
+                    .await;
+            }
+        }
+    });
 }
 
 /// Forward request chunks into the parse pipeline; protocol violations and

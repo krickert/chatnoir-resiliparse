@@ -239,6 +239,8 @@
 #![warn(clippy::pedantic)]
 
 pub mod convert;
+pub mod grpc_frame;
+pub mod raw_service;
 pub mod transport;
 pub mod warc_service;
 

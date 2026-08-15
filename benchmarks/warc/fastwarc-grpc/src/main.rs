@@ -36,6 +36,12 @@ fn full_echo() -> bool {
     env_flag("FASTWARC_GRPC_FULL")
 }
 
+/// Zero-copy mode: raw ParseWarc route on the server, hand-framed gRPC
+/// messages on the client (no tonic codec on the bulk path either side).
+fn raw_mode() -> bool {
+    env_flag("FASTWARC_GRPC_RAW")
+}
+
 /// Remote server URL (`http://host:port`). Unset = in-process Unix socket.
 fn server_url() -> Option<String> {
     std::env::var("FASTWARC_GRPC_URL")
@@ -120,12 +126,9 @@ fn spawn_feeder(
     });
 }
 
-async fn connect_client(
-    remote: Option<&str>,
-    sock: &std::path::Path,
-) -> Result<WarcServiceClient<Channel>, tonic::transport::Error> {
-    let channel = if let Some(url) = remote {
-        fastwarc_grpc::transport::connect(url).await?
+async fn connect_channel(remote: Option<&str>, sock: &std::path::Path) -> Result<Channel, tonic::transport::Error> {
+    if let Some(url) = remote {
+        fastwarc_grpc::transport::connect(url).await
     } else {
         let sock_for_client = sock.to_path_buf();
         fastwarc_grpc::transport::configure_endpoint(tonic::transport::Endpoint::from_static("http://[::]:50051"))
@@ -133,8 +136,15 @@ async fn connect_client(
                 let sock = sock_for_client.clone();
                 async move { Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(sock).await?)) }
             }))
-            .await?
-    };
+            .await
+    }
+}
+
+async fn connect_client(
+    remote: Option<&str>,
+    sock: &std::path::Path,
+) -> Result<WarcServiceClient<Channel>, tonic::transport::Error> {
+    let channel = connect_channel(remote, sock).await?;
     Ok(WarcServiceClient::new(channel)
         .max_decoding_message_size(fastwarc_grpc::transport::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(fastwarc_grpc::transport::MAX_MESSAGE_SIZE))
@@ -144,6 +154,133 @@ async fn connect_client(
 struct Totals {
     count: std::sync::atomic::AtomicUsize,
     bytes: std::sync::atomic::AtomicU64,
+}
+
+/// Request body streaming pre-framed gRPC messages; each queued `Bytes`
+/// becomes one HTTP/2 DATA frame without a copy.
+struct FrameBody {
+    rx: tokio::sync::mpsc::Receiver<prost::bytes::Bytes>,
+}
+
+impl http_body::Body for FrameBody {
+    type Data = prost::bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.rx
+            .poll_recv(cx)
+            .map(|frame| frame.map(|data| Ok(http_body::Frame::data(data))))
+    }
+}
+
+/// Raw-mode feeder: config message, then [prefix, chunk] frame pairs.
+fn spawn_feeder_raw(
+    path: String,
+    tx: tokio::sync::mpsc::Sender<prost::bytes::Bytes>,
+    buf_size: usize,
+    full: bool,
+    local: bool,
+) {
+    std::thread::spawn(move || {
+        let config = pb::ParseWarcConfig {
+            parse_http: false,
+            verify_digests: false,
+            input_buffer_size: buf_size as u32,
+            payload_chunk_size: DEFAULT_PAYLOAD_CHUNK_SIZE as u32,
+            include_payload: Some(full),
+            include_headers: Some(full),
+            response_batch_size: 64,
+            parallelism: parallelism(),
+            archive_path: if local { path.clone() } else { String::new() },
+            ..Default::default()
+        };
+        let config_frame = fastwarc_grpc::grpc_frame::encode_message(&pb::ParseWarcRequest {
+            kind: Some(pb::parse_warc_request::Kind::Config(config)),
+        });
+        if tx.blocking_send(config_frame).is_err() || local {
+            return;
+        }
+        let mut file = std::fs::File::open(&path).expect("File error");
+        loop {
+            let mut buf = Vec::with_capacity(buf_size);
+            match Read::take(Read::by_ref(&mut file), buf_size as u64).read_to_end(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(fastwarc_grpc::grpc_frame::chunk_prefix(n)).is_err()
+                        || tx.blocking_send(buf.into()).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Drive one raw-framed ParseWarc call over the channel; returns
+/// (records, payload bytes).
+async fn run_stream_raw(
+    mut channel: Channel,
+    rx: tokio::sync::mpsc::Receiver<prost::bytes::Bytes>,
+    base_uri: String,
+    totals: std::sync::Arc<Totals>,
+) -> Result<(usize, u64), Box<dyn std::error::Error + Send + Sync>> {
+    use http_body_util::BodyExt;
+    use prost::Message;
+    use std::sync::atomic::Ordering::Relaxed;
+    use tower::Service;
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("{base_uri}/fastwarc.v1.WarcService/ParseWarc"))
+        .version(http::Version::HTTP_2)
+        .header(http::header::TE, "trailers")
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .body(tonic::body::Body::new(FrameBody { rx }))?;
+
+    futures_ready(&mut channel).await?;
+    let response = channel.call(request).await?;
+    let mut body = response.into_body();
+
+    let mut splitter = fastwarc_grpc::grpc_frame::MessageSplitter::new();
+    let mut total_count = 0usize;
+    let mut total_bytes = 0u64;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(trailers) = frame.trailers_ref() {
+            let status = trailers.get("grpc-status").and_then(|v| v.to_str().ok()).unwrap_or("0");
+            if status != "0" {
+                let message = trailers.get("grpc-message").and_then(|v| v.to_str().ok()).unwrap_or("");
+                return Err(format!("grpc-status {status}: {message}").into());
+            }
+            continue;
+        }
+        let Ok(data) = frame.into_data() else { continue };
+        splitter.push(data);
+        while let Some(message) = splitter.next_message(fastwarc_grpc::transport::MAX_MESSAGE_SIZE)? {
+            let response = pb::ParseWarcResponse::decode(message)?;
+            visit_ends(&response, |end| {
+                total_count += 1;
+                total_bytes += end.payload_length;
+                totals.count.fetch_add(1, Relaxed);
+                totals.bytes.fetch_add(end.payload_length, Relaxed);
+            });
+        }
+    }
+    Ok((total_count, total_bytes))
+}
+
+/// Await `poll_ready` on the channel.
+async fn futures_ready(channel: &mut Channel) -> Result<(), tonic::transport::Error> {
+    use tower::Service;
+    std::future::poll_fn(|cx| channel.poll_ready(cx)).await
 }
 
 /// Drive one ParseWarc stream to completion; returns (records, payload bytes).
@@ -212,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  FASTWARC_GRPC_LOCAL=1: server reads WARCFILE from disk; no archive upload");
         println!("  FASTWARC_GRPC_JOBS=N: N concurrent streams; reports aggregate throughput");
         println!("  FASTWARC_GRPC_PARALLEL=N: N server-side workers per stream (gzip member split)");
+        println!("  FASTWARC_GRPC_RAW=1: zero-copy raw framing (no tonic codec on the bulk path)");
         return Ok(());
     }
     let path = args[1].clone();
@@ -225,16 +363,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if remote.is_none() {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock)?;
-        tokio::spawn(
-            fastwarc_grpc::transport::configure_server(tonic::transport::Server::builder())
-                .add_service(fastwarc_grpc::transport::configure_warc_server(WarcServiceServer::new(
-                    WarcParser::with_local_files(),
-                )))
-                .serve_with_incoming(UnixListenerStream::new(listener)),
-        );
+        let mut builder = fastwarc_grpc::transport::configure_server(tonic::transport::Server::builder());
+        if raw_mode() {
+            tokio::spawn(
+                builder
+                    .add_service(fastwarc_grpc::raw_service::RawWarcService::new(WarcParser::with_local_files()))
+                    .serve_with_incoming(UnixListenerStream::new(listener)),
+            );
+        } else {
+            tokio::spawn(
+                builder
+                    .add_service(fastwarc_grpc::transport::configure_warc_server(WarcServiceServer::new(
+                        WarcParser::with_local_files(),
+                    )))
+                    .serve_with_incoming(UnixListenerStream::new(listener)),
+            );
+        }
     }
 
-    let mode = if full { "full payload echo" } else { "parse-only" };
+    let mode = if raw_mode() {
+        if full {
+            "full payload echo, raw frames"
+        } else {
+            "parse-only, raw frames"
+        }
+    } else if full {
+        "full payload echo"
+    } else {
+        "parse-only"
+    };
     let transport = if remote.is_some() { "tcp" } else { "uds" };
     let source = if local {
         "local file".to_owned()
@@ -262,10 +419,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut handles = Vec::new();
     for _ in 0..jobs {
-        let (tx, rx) = tokio::sync::mpsc::channel::<pb::ParseWarcRequest>(request_channel_bound(buf_size));
-        spawn_feeder(path.clone(), tx, buf_size, full, local);
-        let client = connect_client(remote.as_deref(), &sock).await?;
-        handles.push(tokio::spawn(run_stream(client, rx, totals.clone())));
+        if raw_mode() {
+            let (tx, rx) = tokio::sync::mpsc::channel::<prost::bytes::Bytes>(request_channel_bound(buf_size) * 2);
+            spawn_feeder_raw(path.clone(), tx, buf_size, full, local);
+            let channel = connect_channel(remote.as_deref(), &sock).await?;
+            let base_uri = remote.clone().unwrap_or_else(|| "http://[::]:50051".to_owned());
+            handles.push(tokio::spawn(run_stream_raw(channel, rx, base_uri, totals.clone())));
+        } else {
+            let (tx, rx) = tokio::sync::mpsc::channel::<pb::ParseWarcRequest>(request_channel_bound(buf_size));
+            spawn_feeder(path.clone(), tx, buf_size, full, local);
+            let client = connect_client(remote.as_deref(), &sock).await?;
+            handles.push(tokio::spawn(run_stream(client, rx, totals.clone())));
+        }
     }
     let mut total_count = 0usize;
     let mut total_bytes = 0u64;

@@ -327,6 +327,9 @@ name = "fastwarc-grpc"
 version = "0.1.0"
 dependencies = [
  "fastwarc",
+ "http",
+ "http-body",
+ "http-body-util",
  "prost",
  "prost-types",
  "time",
@@ -337,6 +340,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
+ "tower-service",
 ]
 
 [[package]]
@@ -345,7 +349,11 @@ version = "0.1.0"
 dependencies = [
  "fastwarc",
  "fastwarc-grpc",
+ "http",
+ "http-body",
+ "http-body-util",
  "hyper-util",
+ "prost",
  "tokio",
  "tokio-stream",
  "tonic",
