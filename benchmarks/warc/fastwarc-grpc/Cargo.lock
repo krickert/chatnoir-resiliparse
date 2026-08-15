@@ -353,6 +353,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper-util",
+ "libc",
  "prost",
  "tokio",
  "tokio-stream",

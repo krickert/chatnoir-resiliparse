@@ -18,6 +18,10 @@ path = "src/rawuds.rs"
 name = "splitcheck"
 path = "src/splitcheck.rs"
 
+[[bin]]
+name = "compare"
+path = "src/compare.rs"
+
 [dependencies]
 fastwarc-grpc = { path = "../../../fastwarc-grpc" }
 fastwarc = { path = "../../../fastwarc-rs" }
@@ -30,3 +34,4 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 prost = "0.14"
+libc = "0.2"
