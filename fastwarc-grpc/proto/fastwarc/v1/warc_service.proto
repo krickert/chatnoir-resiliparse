@@ -120,7 +120,8 @@ message ParseWarcConfig {
   // (http_content_type, http_charset, record_id, record_date) stays populated.
   optional bool include_headers = 14;
   // response_batch_size packs this many protocol events into one gRPC
-  // `batch` message. Zero (the default) sends one event per message.
+  // `batch` message. Zero (the default) sends one event per message. A
+  // partial batch is sent before the server waits for more upload input.
   uint32 response_batch_size = 15;
   // archive_path is a filesystem path on the server for ParseWarc. When set,
   // the server opens this file and ignores chunk contents. Later messages

@@ -22,7 +22,7 @@ contracts are in [`proto/`](proto).
   framing error returns the records parsed so far plus one non-recoverable error.
 - `include_payload` / `include_headers` default to true. Set false to skip payload bytes and/or lossless header blocks.
   `response_batch_size` packs that many protocol events into one `batch` message (zero = one event per message; batches
-  flush as they fill).
+  flush as they fill, and before the server waits for more upload input).
 - Filters matching Python `ArchiveIterator`: `record_types`, `min_content_length`, `max_content_length`, and
   `BuiltinFilter` predicates.
 - `grpc.health.v1.Health` for load-balancer probes.
