@@ -142,8 +142,10 @@ fn emit_record(
     emit(response(pb::parse_warc_response::Kind::RecordEnd(pb::RecordEnd { payload_length })))
 }
 
-/// Streams chunks and returns their total length. On failure, returns the
-/// bytes sent so far and the error. `None` means the consumer stopped.
+/// Streams chunks and returns their total length. Reader windows are
+/// coalesced up to `chunk_size`, so small decoder or upload buffers do not
+/// multiply events. On failure, returns the bytes sent so far and the error.
+/// `None` means the consumer stopped.
 fn stream_payload(
     record: &mut WarcRecord,
     chunk_size: usize,
@@ -154,21 +156,45 @@ fn stream_payload(
     };
     let mut offset = 0u64;
     loop {
-        let window = match reader.fill_buf() {
-            Ok(window) => window,
-            Err(error) => return Err((offset, error)),
-        };
-        if window.is_empty() {
-            return Ok(Some(offset));
+        let (data, end) = fill_chunk(reader, chunk_size);
+        if !data.is_empty() {
+            let len = data.len() as u64;
+            let chunk = pb::PayloadChunk {
+                offset,
+                data: Bytes::from(data),
+            };
+            if !emit(response(pb::parse_warc_response::Kind::PayloadChunk(chunk))) {
+                return Ok(None);
+            }
+            offset += len;
         }
-        let n = window.len().min(chunk_size);
-        let data = Bytes::copy_from_slice(&window[..n]);
-        reader.consume(n);
-        if !emit(response(pb::parse_warc_response::Kind::PayloadChunk(pb::PayloadChunk { offset, data }))) {
-            return Ok(None);
+        match end {
+            None => {}
+            Some(Ok(())) => return Ok(Some(offset)),
+            Some(Err(error)) => return Err((offset, error)),
         }
-        offset += n as u64;
     }
+}
+
+/// Reads up to `chunk_size` bytes across reader windows. Also returns how the
+/// payload ended, if it did: `Ok` at EOF, or the read error. The buffer starts
+/// at the first window's size so short payloads do not reserve a full chunk.
+fn fill_chunk(reader: &mut impl BufRead, chunk_size: usize) -> (Vec<u8>, Option<io::Result<()>>) {
+    let mut data = Vec::new();
+    while data.len() < chunk_size {
+        let window = match reader.fill_buf() {
+            Ok([]) => return (data, Some(Ok(()))),
+            Ok(window) => window,
+            Err(error) => return (data, Some(Err(error))),
+        };
+        let n = window.len().min(chunk_size - data.len());
+        if !data.is_empty() {
+            data.reserve_exact(chunk_size - data.len());
+        }
+        data.extend_from_slice(&window[..n]);
+        reader.consume(n);
+    }
+    (data, None)
 }
 
 /// Wraps an event kind in a `ParseWarcResponse` envelope.

@@ -123,3 +123,39 @@ fn rejecting_payload_stops_emission() {
     });
     assert!(rejected);
 }
+
+/// Payload chunks fill `payload_chunk_size` even when the reader serves
+/// smaller windows, such as decompressor buffers or small upload chunks.
+#[test]
+fn small_reader_windows_are_coalesced_into_full_chunks() {
+    let payload: Vec<u8> = (0..=u8::MAX).cycle().take(200_000).collect();
+    let mut data = Vec::new();
+    write!(data, "WARC/1.0\r\nWARC-Type: resource\r\nContent-Length: {}\r\n\r\n", payload.len()).unwrap();
+    data.extend_from_slice(&payload);
+    data.extend_from_slice(b"\r\n\r\n");
+
+    let chunk_size = 64 << 10;
+    let config = pb::ParseWarcConfig {
+        parse_http: Some(false),
+        payload_chunk_size: chunk_size.try_into().unwrap(),
+        ..Default::default()
+    };
+    let mut chunks = Vec::new();
+    let reader = io::BufReader::with_capacity(1024, io::Cursor::new(data));
+    parse_into(RawReaderAdapter::new(reader), &config, &mut |event| {
+        if let Some(pb::parse_warc_response::Kind::PayloadChunk(chunk)) = event.kind {
+            chunks.push(chunk);
+        }
+        true
+    });
+
+    let sizes: Vec<_> = chunks.iter().map(|chunk| chunk.data.len()).collect();
+    assert_eq!(sizes, [chunk_size, chunk_size, chunk_size, payload.len() - 3 * chunk_size]);
+    assert_eq!(
+        chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect::<Vec<_>>(),
+        payload
+    );
+}
